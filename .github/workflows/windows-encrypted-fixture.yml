@@ -1,0 +1,48 @@
+name: Windows encrypted fixture
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '11.0.100'
+      - name: Run encrypted inert fixture
+        shell: pwsh
+        env:
+          LAB_KEY: ${{ secrets.LAB_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:LAB_KEY) { throw 'Missing lab key' }
+          $blob = [Convert]::FromBase64String((Get-Content 'payload.b64' -Raw).Trim())
+          $key = [Convert]::FromBase64String($env:LAB_KEY)
+          if ($blob.Length -lt 29) { throw 'Invalid encrypted payload' }
+          $nonce = [byte[]]::new(12)
+          $cipher = [byte[]]::new($blob.Length - 28)
+          $tag = [byte[]]::new(16)
+          [System.Buffer]::BlockCopy($blob, 0, $nonce, 0, 12)
+          [System.Buffer]::BlockCopy($blob, 12, $cipher, 0, $cipher.Length)
+          [System.Buffer]::BlockCopy($blob, $blob.Length - 16, $tag, 0, 16)
+          $plain = [byte[]]::new($cipher.Length)
+          $aes = [System.Security.Cryptography.AesGcm]::new($key, 16)
+          try { $aes.Decrypt($nonce, $cipher, $tag, $plain, [Text.Encoding]::UTF8.GetBytes('esc08-dotnet11-v1')) } finally { $aes.Dispose() }
+          [IO.File]::WriteAllBytes((Join-Path $PWD 'bundle.zip'), $plain)
+          New-Item -ItemType Directory -Path 'lab' | Out-Null
+          [IO.Compression.ZipFile]::ExtractToDirectory((Resolve-Path 'bundle.zip').Path, (Resolve-Path 'lab').Path)
+          & pwsh -NoProfile -File 'lab/run.ps1' *> 'runner-output.txt'
+          if ($LASTEXITCODE -ne 0) { Write-Output "MATRIX_FAIL exit=$LASTEXITCODE"; exit 1 }
+          if (-not (Test-Path 'lab/evidence.bin')) { throw 'Missing encrypted evidence' }
+          Write-Output 'MATRIX_PASS'
+          Write-Output "evidence_sha256=$((Get-FileHash -Algorithm SHA256 'lab/evidence.bin').Hash.ToLowerInvariant())"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-evidence
+          path: lab/evidence.bin
+          retention-days: 7
